@@ -3,11 +3,7 @@ package com.linkedin.databus2.producers;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
-import java.sql.Time;
-import java.sql.Timestamp;
 import java.util.ArrayList;
-import java.util.Calendar;
-import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -40,36 +36,22 @@ import com.google.code.or.binlog.impl.event.XidEvent;
 import com.google.code.or.common.glossary.Column;
 import com.google.code.or.common.glossary.Pair;
 import com.google.code.or.common.glossary.Row;
-import com.google.code.or.common.glossary.column.BitColumn;
-import com.google.code.or.common.glossary.column.BlobColumn;
-import com.google.code.or.common.glossary.column.DateColumn;
-import com.google.code.or.common.glossary.column.Datetime2Column;
-import com.google.code.or.common.glossary.column.DatetimeColumn;
-import com.google.code.or.common.glossary.column.DecimalColumn;
-import com.google.code.or.common.glossary.column.DoubleColumn;
-import com.google.code.or.common.glossary.column.EnumColumn;
-import com.google.code.or.common.glossary.column.FloatColumn;
 import com.google.code.or.common.glossary.column.Int24Column;
 import com.google.code.or.common.glossary.column.LongColumn;
 import com.google.code.or.common.glossary.column.LongLongColumn;
 import com.google.code.or.common.glossary.column.NullColumn;
-import com.google.code.or.common.glossary.column.SetColumn;
 import com.google.code.or.common.glossary.column.ShortColumn;
-import com.google.code.or.common.glossary.column.StringColumn;
-import com.google.code.or.common.glossary.column.TimeColumn;
-import com.google.code.or.common.glossary.column.TimestampColumn;
 import com.google.code.or.common.glossary.column.TinyColumn;
-import com.google.code.or.common.glossary.column.YearColumn;
 import com.linkedin.databus.core.DatabusRuntimeException;
 import com.linkedin.databus.core.DatabusThreadBase;
 import com.linkedin.databus.core.DbusOpcode;
-import com.linkedin.databus.core.util.StringUtils;
 import com.linkedin.databus2.core.DatabusException;
 import com.linkedin.databus2.producers.ds.DbChangeEntry;
 import com.linkedin.databus2.producers.ds.KeyPair;
 import com.linkedin.databus2.producers.ds.PerSourceTransaction;
 import com.linkedin.databus2.producers.ds.PrimaryKeySchema;
 import com.linkedin.databus2.producers.ds.Transaction;
+import com.linkedin.databus2.producers.util.Or2AvroConvert;
 import com.linkedin.databus2.schemas.NoSuchSchemaException;
 import com.linkedin.databus2.schemas.SchemaRegistryService;
 import com.linkedin.databus2.schemas.VersionedSchema;
@@ -136,6 +118,9 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
 
   /** Track all the table map events, cleared when the binlog rotated **/
   private final Map<Long, TableMapEvent> _tableMapEvents = new HashMap<Long, TableMapEvent>();
+  
+  /** Transaction into buffer thread */
+  private final TransactionWriter _transactionWriter;
 
   /** Shared queue to transfer binlog events from OpenReplicator to ORlistener thread **/
   private BlockingQueue<BinlogEventV4> _binlogEventQueue = null;
@@ -174,6 +159,8 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
     _currFileNum = currentFileNumber;
     _binlogEventQueue = new LinkedBlockingQueue<BinlogEventV4>(maxQueueSize);
     _queueTimeoutMs = queueTimeoutMs;
+    _transactionWriter = new TransactionWriter(maxQueueSize, queueTimeoutMs, txnProcessor);
+    _transactionWriter.start();
   }
 
   @Override
@@ -235,11 +222,7 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
 
     try
     {
-      _txnProcessor.onEndTransaction(_transaction);
-    } catch (DatabusException e3)
-    {
-      _log.error("Got exception in the transaction handler ",e3);
-      throw new DatabusRuntimeException(e3);
+      _transactionWriter.addTransaction(_transaction);
     }
     finally
     {
@@ -380,7 +363,7 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
         GenericRecord gr = new GenericData.Record(schema);
         generateAvroEvent(vs, cl, gr);
 
-        List<KeyPair> kps = generateKeyPair(cl, schema);
+        List<KeyPair> kps = generateKeyPair(gr, vs);
 
         DbChangeEntry db = new DbChangeEntry(scn, timestampInNanos, gr, doc, isReplicated, schema, kps);
         _transaction.getPerSourceTransaction(_tableUriToSrcIdMap.get(tableName)).mergeDbChangeEntrySet(db);
@@ -394,36 +377,48 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
     }
   }
 
-  private List<KeyPair> generateKeyPair(List<Column> cl, Schema schema)
+  private List<KeyPair> generateKeyPair(GenericRecord gr, VersionedSchema versionedSchema)
       throws DatabusException
   {
-
     Object o = null;
     Schema.Type st = null;
-
-    // Build PrimaryKeySchema
-    String pkFieldName = SchemaHelper.getMetaField(schema, "pk");
-    if(pkFieldName == null)
+    List<Field> pkFieldList = versionedSchema.getPkFieldList();
+    if(pkFieldList.isEmpty())
     {
-      throw new DatabusException("No primary key specified in the schema");
+      String pkFieldName = SchemaHelper.getMetaField(versionedSchema.getSchema(), "pk");
+	  if (pkFieldName == null)
+	  {
+		throw new DatabusException("No primary key specified in the schema");
+	  }
+	  PrimaryKeySchema pkSchema = new PrimaryKeySchema(pkFieldName);
+	  List<Schema.Field> fields = versionedSchema.getSchema().getFields();
+	  for (int i = 0; i < fields.size(); i++)
+	  {
+		Schema.Field field = fields.get(i);
+		if (pkSchema.isPartOfPrimaryKey(field))
+		{
+		  pkFieldList.add(field);
+		}
+	  }
     }
-
-    PrimaryKeySchema pkSchema = new PrimaryKeySchema(pkFieldName);
-    List<Schema.Field> fields = schema.getFields();
     List<KeyPair> kpl = new ArrayList<KeyPair>();
-    int cnt = 0;
-    for(Schema.Field field : fields)
+    for (Field field : pkFieldList)
     {
-      if (pkSchema.isPartOfPrimaryKey(field))
-      {
-        o = orToAvroType(cl.get(cnt), field);
-        st = field.schema().getType();
-        KeyPair kp = new KeyPair(o, st);
-        kpl.add(kp);
-      }
-      cnt++;
+      o = gr.get(field.name());
+      st = field.schema().getType();
+      KeyPair kp = new KeyPair(o, st);
+      kpl.add(kp);
     }
-
+    if (kpl == null || kpl.isEmpty())
+    {
+      String pkFieldName = SchemaHelper.getMetaField(versionedSchema.getSchema(), "pk");
+      StringBuilder sb = new StringBuilder();
+      for (Schema.Field f : versionedSchema.getSchema().getFields())
+      {
+        sb.append(f.name()).append(",");
+      }
+      throw new DatabusException("pk is assigned to " + pkFieldName + " but fieldList is " + sb.toString());
+    }
     return kpl;
   }
 
@@ -516,113 +511,14 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
   private Object orToAvroType(Column s, Field avroField)
       throws DatabusException
   {
-	if (s instanceof NullColumn)
+	try
 	{
-		return null;
+	  return Or2AvroConvert.convert(s, avroField);
 	}
-	String fieldTypeSchemaStr = avroField.schema().toString();
-	if (fieldTypeSchemaStr.contains("int"))
+	catch (Exception e)
 	{
-		return Integer.parseInt(s.getValue() + "") + (int) unsignedOffset(s, avroField);
+	  throw new DatabusRuntimeException("Unknown MySQL type in the event" + s.getClass() + " Object = " + s, e);
 	}
-	if (fieldTypeSchemaStr.contains("long"))
-	{
-		if (s.getValue() instanceof Date)
-		{
-			return ((Date) s.getValue()).getTime();
-		}
-		if (s instanceof LongLongColumn)
-		{
-			LongLongColumn llc = (LongLongColumn) s;
-			BigInteger b = new BigInteger(llc.getValue() + "");
-			return b.add(new BigInteger(unsignedOffset(s, avroField) + ""));
-		}
-		return Long.parseLong(s.getValue() + "") + unsignedOffset(s, avroField);
-	}
-	if (fieldTypeSchemaStr.contains("double"))
-	{
-		return Double.parseDouble(s.getValue() + "");
-	}
-	if (fieldTypeSchemaStr.contains("string"))
-	{
-		if (s.getValue() instanceof byte[])
-		{
-			return new String((byte[]) s.getValue(), Charset.defaultCharset());
-		}
-		return s.getValue() + "";
-	}
-	if (fieldTypeSchemaStr.contains("bytes"))
-	{
-		if (!(s.getValue() instanceof byte[]))
-		{
-			throw new DatabusException(avroField.name()+" need convert to bytes,but the column type is " + s.getClass());
-		}
-		byte[] byteArr = (byte[]) s.getValue();
-		return ByteBuffer.wrap(byteArr);
-	}
-	if (fieldTypeSchemaStr.contains("float"))
-	{
-		return Float.parseFloat(s.getValue() + "");
-	}
-    else
-    {
-      throw new DatabusRuntimeException("Unknown schema type " + fieldTypeSchemaStr + " Object = " + s);
-    }
-  }
-  
-  private long unsignedOffset(Column s, Field avroField)
-  {
-    if (s instanceof Int24Column)
-    {
-      Int24Column ic = (Int24Column) s;
-      Integer i = ic.getValue();
-      if (i < 0 && SchemaHelper.getMetaField(avroField, "dbFieldType").contains("UNSIGNED"))
-      {
-        return ORListener.MEDIUMINT_MAX_VALUE;
-      }
-      return 0;
-    }
-    else if (s instanceof LongColumn)
-    {
-      LongColumn lc = (LongColumn) s;
-      Long i = lc.getValue().longValue();
-      if (i < 0 && SchemaHelper.getMetaField(avroField, "dbFieldType").contains("UNSIGNED"))
-      {
-        return ORListener.INTEGER_MAX_VALUE;
-      }
-      return 0;
-    }
-    else if (s instanceof LongLongColumn)
-    {
-      LongLongColumn llc = (LongLongColumn) s;
-      Long l = llc.getValue();
-      if (l < 0 && SchemaHelper.getMetaField(avroField, "dbFieldType").contains("UNSIGNED"))
-      {
-        return ORListener.BIGINT_MAX_VALUE.longValue();
-      }
-      return 0;
-    }
-    else if (s instanceof ShortColumn)
-    {
-      ShortColumn sc = (ShortColumn) s;
-      Integer i = sc.getValue();
-      if (i < 0 && SchemaHelper.getMetaField(avroField, "dbFieldType").contains("UNSIGNED"))
-      {
-        return ORListener.SMALLINT_MAX_VALUE;
-      }
-      return 0;
-    }
-    else if (s instanceof TinyColumn)
-    {
-      TinyColumn tc = (TinyColumn) s;
-      Integer i = tc.getValue();
-      if (i < 0 && SchemaHelper.getMetaField(avroField, "dbFieldType").contains("UNSIGNED"))
-      {
-        return ORListener.TINYINT_MAX_VALUE;
-      }
-      return 0;
-    }
-    return 0;
   }
 
   /**
@@ -819,5 +715,17 @@ class ORListener extends DatabusThreadBase implements BinlogEventListener
     }
     _log.info("ORListener Thread done");
     doShutdownNotify();
+  }
+
+  public void shutdownAll()
+  {
+    if(this.isAlive())
+    {
+      this.shutdown();
+    }
+    if (_transactionWriter != null && _transactionWriter.isAlive())
+    {
+      _transactionWriter.shutdown();
+    }
   }
 }
